@@ -162,7 +162,30 @@ class MySQLRouterCharm(charms_openstack.charm.OpenStackCharm):
         :returns: Address
         :rtype: str
         """
-        return self.options.db_router_address
+        # db_router_address calls get_relation_ip from charmhelpers, and rely
+        # on private-address. The only values possible for this method to
+        # return are either the private or the FAN address.
+        relation_ip = self.options.db_router_address
+        # Check if there is a FAN network IP tht could be a suitable option:
+        route_ip = None
+        cmd = ["ip", "route", "get", self.cluster_address]
+        try:
+            route_out = subprocess.check_output(cmd).decode("utf-8")
+            if "via" in route_out:
+                route_ip = route_out.split()[6]
+            else:
+                route_ip = route_out.split()[4]
+        except (subprocess.CalledProcessError, KeyError, AttributeError):
+            # No IP was found, return the relation data
+            return relation_ip
+        # Check if there is a route_ip
+        if route_ip:
+            # Ensure we are not dealing with another IP of the same interface
+            # CIDRs for route_ip and relation_ip should not be the same:
+            relation_cidr = ch_net_ip.resolve_network_cidr(relation_ip)
+            if ch_net_ip.resolve_network_cidr(route_ip) != relation_cidr:
+                return route_ip
+        return relation_ip
 
     @property
     def cluster_address(self):

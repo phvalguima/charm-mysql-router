@@ -75,6 +75,7 @@ class TestMySQLRouterCharm(test_utils.PatchHelper):
         self.patch_object(mysql_router.ch_core.host, "group_exists")
         self.patch_object(mysql_router.ch_core.host, "mkdir")
         self.patch_object(mysql_router.ch_core.host, "cmp_pkgrevno")
+        self.patch_object(mysql_router.ch_net_ip, "resolve_network_cidr")
 
         self.stdout = mock.MagicMock()
         self.subprocess.STDOUT = self.stdout
@@ -198,11 +199,53 @@ class TestMySQLRouterCharm(test_utils.PatchHelper):
 
     def test_db_router_address(self):
         _addr = "10.10.10.30"
+        self.subprocess.check_output.return_value = \
+            b'10.10.10.10 dev eth0 src 10.10.10.30 uid 1000\n    cache'
+        # IP in the same network as .30
+        self.endpoint_from_flag.return_value = self.db_router
+        self.db_router.db_host.return_value = '"10.10.10.10"'
         self.get_relation_ip.return_value = _addr
         mrc = mysql_router.MySQLRouterCharm()
         self.assertEqual(
             mrc.db_router_address,
             _addr)
+
+    def test_db_router_address_with_fan_network(self):
+        # mysql-router has eth0 -> 10.10.10.30 and fan-252 -> 252.0.10.20
+        _addr = "10.10.10.30"
+        self.subprocess.check_output.return_value = \
+            b'252.0.10.10 dev eth0 src 252.0.10.20 uid 1000\n    cache'
+        # First call returns the network for relation_ip which corresponds
+        # to the relation and the second call returns the subnet for the
+        # fan subnet.
+        self.resolve_network_cidr.side_effect = [
+            "10.10.10.0/24", "252.0.10.0/24"]
+        self.endpoint_from_flag.return_value = self.db_router
+        # IP of the database in the fan-network
+        self.db_router.db_host.return_value = '"252.0.10.10"'
+        self.get_relation_ip.return_value = _addr
+        mrc = mysql_router.MySQLRouterCharm()
+        self.assertEqual(
+            mrc.db_router_address,
+            "252.0.10.20")
+
+        # Now, check the case where fan-net is crossing nodes.
+        # That will render two nodes with two subnets in 252.0.0.0/8
+        # Each node will have its own /24 share of the fan-network cidr.
+        self.subprocess.check_output.reset_mock()
+        self.resolve_network_cidr.reset_mock()
+        # There is a gateway now, which is the host IP
+        self.subprocess.check_output.return_value = \
+            b'252.0.10.10 via 252.0.10.1 dev eth0 src 252.0.10.20 uid 1000\n    cache' # noqa
+        # First call returns the network for relation_ip which corresponds
+        # to the relation and the second call returns the subnet for the
+        # fan subnet.
+        self.resolve_network_cidr.side_effect = [
+            "252.0.20.0/24", "252.0.10.0/24"]
+        mrc = mysql_router.MySQLRouterCharm()
+        self.assertEqual(
+            mrc.db_router_address,
+            "252.0.10.20")
 
     def test_cluster_address(self):
         _json_addr = '"10.10.10.50"'
@@ -388,16 +431,29 @@ class TestMySQLRouterCharm(test_utils.PatchHelper):
         # Successful < 8.0.22
         self.cmp_pkgrevno.return_value = -1
         mrc.bootstrap_mysqlrouter()
-        self.subprocess.check_output.assert_called_once_with(
-            [mrc.mysqlrouter_bin, "--user", _user, "--name", mrc.name,
-             "--bootstrap", "{}:{}@{}"
-             .format(mrc.db_router_user, _pass, _addr),
-             "--directory", mrc.mysqlrouter_working_dir,
-             "--conf-use-sockets",
-             "--conf-bind-address", mrc.shared_db_address,
-             "--report-host", mrc.db_router_address,
-             "--conf-base-port", _port],
-            stderr=self.stdout)
+        self.subprocess.check_output.assert_has_calls([
+            mock.call(['ip', 'route', 'get', '10.10.10.60']),
+            mock.call().decode('utf-8'),
+            mock.call().decode().__contains__('via'),
+            mock.call().decode().split(),
+            mock.call().decode().split().__getitem__(4),
+            mock.call().decode().split().__getitem__().__bool__(),
+            mock.call(
+                [mrc.mysqlrouter_bin, "--user", _user,
+                 "--name", mrc.name,
+                 "--bootstrap", "{}:{}@{}"
+                 .format(mrc.db_router_user, _pass, _addr),
+                 "--directory", mrc.mysqlrouter_working_dir,
+                 "--conf-use-sockets",
+                 "--conf-bind-address", mrc.shared_db_address,
+                 "--report-host", mrc.db_router_address,
+                 "--conf-base-port", _port], stderr=self.stdout),
+            mock.call(['ip', 'route', 'get', '10.10.10.60']),
+            mock.call().decode('utf-8'),
+            mock.call().decode().__contains__('via'),
+            mock.call().decode().split(),
+            mock.call().decode().split().__getitem__(4),
+            mock.call().decode().split().__getitem__().__bool__()])
         self.set_flag.assert_has_calls([
             mock.call(mysql_router.MYSQL_ROUTER_BOOTSTRAP_ATTEMPTED),
             mock.call(mysql_router.MYSQL_ROUTER_BOOTSTRAPPED)])
@@ -410,17 +466,31 @@ class TestMySQLRouterCharm(test_utils.PatchHelper):
         self.clear_flag.reset_mock()
         self.cmp_pkgrevno.return_value = 1
         mrc.bootstrap_mysqlrouter()
-        self.subprocess.check_output.assert_called_once_with(
-            [mrc.mysqlrouter_bin, "--user", _user, "--name", mrc.name,
-             "--bootstrap", "{}:{}@{}"
-             .format(mrc.db_router_user, _pass, _addr),
-             "--directory", mrc.mysqlrouter_working_dir,
-             "--conf-use-sockets",
-             "--conf-bind-address", mrc.shared_db_address,
-             "--report-host", mrc.db_router_address,
-             "--conf-base-port", _port,
-             "--disable-rest"],
-            stderr=self.stdout)
+        self.subprocess.check_output.assert_has_calls([
+            mock.call(['ip', 'route', 'get', '10.10.10.60']),
+            mock.call().decode('utf-8'),
+            mock.call().decode().__contains__('via'),
+            mock.call().decode().split(),
+            mock.call().decode().split().__getitem__(4),
+            mock.call().decode().split().__getitem__().__bool__(),
+            mock.call(
+                [mrc.mysqlrouter_bin, "--user", _user,
+                 "--name", mrc.name,
+                 "--bootstrap", "{}:{}@{}"
+                 .format(mrc.db_router_user, _pass, _addr),
+                 "--directory", mrc.mysqlrouter_working_dir,
+                 "--conf-use-sockets",
+                 "--conf-bind-address", mrc.shared_db_address,
+                 "--report-host", mrc.db_router_address,
+                 "--conf-base-port", _port,
+                 "--disable-rest"],
+                stderr=self.stdout),
+            mock.call(['ip', 'route', 'get', '10.10.10.60']),
+            mock.call().decode('utf-8'),
+            mock.call().decode().__contains__('via'),
+            mock.call().decode().split(),
+            mock.call().decode().split().__getitem__(4),
+            mock.call().decode().split().__getitem__().__bool__()])
         self.set_flag.assert_has_calls([
             mock.call(mysql_router.MYSQL_ROUTER_BOOTSTRAP_ATTEMPTED),
             mock.call(mysql_router.MYSQL_ROUTER_BOOTSTRAPPED)])
@@ -452,17 +522,31 @@ class TestMySQLRouterCharm(test_utils.PatchHelper):
         self.is_flag_set.side_effect = [False, True]
         self.subprocess.check_output.side_effect = None
         mrc.bootstrap_mysqlrouter()
-        self.subprocess.check_output.assert_called_once_with(
-            [mrc.mysqlrouter_bin, "--user", _user, "--name", mrc.name,
-             "--bootstrap", "{}:{}@{}"
-             .format(mrc.db_router_user, _pass, _addr),
-             "--directory", mrc.mysqlrouter_working_dir,
-             "--conf-use-sockets",
-             "--conf-bind-address", mrc.shared_db_address,
-             "--report-host", mrc.db_router_address,
-             "--conf-base-port", _port,
-             "--disable-rest", "--force"],
-            stderr=self.stdout)
+        self.subprocess.check_output.assert_has_calls([
+            mock.call(['ip', 'route', 'get', '10.10.10.60']),
+            mock.call().decode('utf-8'),
+            mock.call().decode().__contains__('via'),
+            mock.call().decode().split(),
+            mock.call().decode().split().__getitem__(4),
+            mock.call().decode().split().__getitem__().__bool__(),
+            mock.call(
+                [mrc.mysqlrouter_bin, "--user", _user,
+                 "--name", mrc.name,
+                 "--bootstrap", "{}:{}@{}"
+                 .format(mrc.db_router_user, _pass, _addr),
+                 "--directory", mrc.mysqlrouter_working_dir,
+                 "--conf-use-sockets",
+                 "--conf-bind-address", mrc.shared_db_address,
+                 "--report-host", mrc.db_router_address,
+                 "--conf-base-port", _port,
+                 "--disable-rest", "--force"],
+                stderr=self.stdout),
+            mock.call(['ip', 'route', 'get', '10.10.10.60']),
+            mock.call().decode('utf-8'),
+            mock.call().decode().__contains__('via'),
+            mock.call().decode().split(),
+            mock.call().decode().split().__getitem__(4),
+            mock.call().decode().split().__getitem__().__bool__()])
         self.set_flag.assert_has_calls([
             mock.call(mysql_router.MYSQL_ROUTER_BOOTSTRAP_ATTEMPTED),
             mock.call(mysql_router.MYSQL_ROUTER_BOOTSTRAPPED)])
